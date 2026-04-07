@@ -4,8 +4,8 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use api::{
-    max_tokens_for_model, resolve_model_alias, ContentBlockDelta, InputContentBlock, InputMessage,
-    MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
+    max_tokens_for_model, resolve_model_alias, ApiError, ContentBlockDelta, InputContentBlock,
+    InputMessage, MessageRequest, MessageResponse, OutputContentBlock, ProviderClient,
     StreamEvent as ApiStreamEvent, ToolChoice, ToolDefinition, ToolResultContentBlock,
 };
 use plugins::PluginTool;
@@ -22,10 +22,11 @@ use runtime::{
     team_cron_registry::{CronRegistry, TeamRegistry},
     worker_boot::{WorkerReadySnapshot, WorkerRegistry},
     write_file, ApiClient, ApiRequest, AssistantEvent, BashCommandInput, BashCommandOutput,
-    BranchFreshness, ContentBlock, ConversationMessage, ConversationRuntime, GrepSearchInput,
-    LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName, LaneEventStatus,
-    LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode, PermissionPolicy,
-    PromptCacheEvent, RuntimeError, Session, TaskPacket, ToolError, ToolExecutor,
+    BranchFreshness, ConfigLoader, ContentBlock, ConversationMessage, ConversationRuntime,
+    GrepSearchInput, LaneCommitProvenance, LaneEvent, LaneEventBlocker, LaneEventName,
+    LaneEventStatus, LaneFailureClass, McpDegradedReport, MessageRole, PermissionMode,
+    PermissionPolicy, PromptCacheEvent, ProviderFallbackConfig, RuntimeError, Session, TaskPacket,
+    ToolError, ToolExecutor,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -2973,53 +2974,264 @@ fn todo_store_path() -> Result<std::path::PathBuf, String> {
 }
 
 fn resolve_skill_path(skill: &str) -> Result<std::path::PathBuf, String> {
+    let cwd = std::env::current_dir().map_err(|error| error.to_string())?;
+    match commands::resolve_skill_path(&cwd, skill) {
+        Ok(path) => Ok(path),
+        Err(_) => resolve_skill_path_from_compat_roots(skill),
+    }
+}
+
+fn resolve_skill_path_from_compat_roots(skill: &str) -> Result<std::path::PathBuf, String> {
     let requested = skill.trim().trim_start_matches('/').trim_start_matches('$');
     if requested.is_empty() {
         return Err(String::from("skill must not be empty"));
     }
 
-    let mut candidates = Vec::new();
-    if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
-        candidates.push(std::path::PathBuf::from(claw_config_home).join("skills"));
-    }
-    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
-        candidates.push(std::path::PathBuf::from(codex_home).join("skills"));
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        let home = std::path::PathBuf::from(home);
-        candidates.push(home.join(".claw").join("skills"));
-        candidates.push(home.join(".agents").join("skills"));
-        candidates.push(home.join(".config").join("opencode").join("skills"));
-        candidates.push(home.join(".codex").join("skills"));
-        candidates.push(home.join(".claude").join("skills"));
-    }
-    candidates.push(std::path::PathBuf::from("/home/bellman/.claw/skills"));
-    candidates.push(std::path::PathBuf::from("/home/bellman/.codex/skills"));
-
-    for root in candidates {
-        let direct = root.join(requested).join("SKILL.md");
-        if direct.exists() {
-            return Ok(direct);
-        }
-
-        if let Ok(entries) = std::fs::read_dir(&root) {
-            for entry in entries.flatten() {
-                let path = entry.path().join("SKILL.md");
-                if !path.exists() {
-                    continue;
-                }
-                if entry
-                    .file_name()
-                    .to_string_lossy()
-                    .eq_ignore_ascii_case(requested)
-                {
-                    return Ok(path);
-                }
-            }
+    for root in skill_lookup_roots() {
+        if let Some(path) = resolve_skill_path_in_root(&root, requested) {
+            return Ok(path);
         }
     }
 
     Err(format!("unknown skill: {requested}"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkillLookupOrigin {
+    SkillsDir,
+    LegacyCommandsDir,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillLookupRoot {
+    path: std::path::PathBuf,
+    origin: SkillLookupOrigin,
+}
+
+fn skill_lookup_roots() -> Vec<SkillLookupRoot> {
+    let mut roots = Vec::new();
+
+    if let Ok(cwd) = std::env::current_dir() {
+        push_project_skill_lookup_roots(&mut roots, &cwd);
+    }
+
+    if let Ok(claw_config_home) = std::env::var("CLAW_CONFIG_HOME") {
+        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&claw_config_home));
+    }
+    if let Ok(codex_home) = std::env::var("CODEX_HOME") {
+        push_prefixed_skill_lookup_roots(&mut roots, std::path::Path::new(&codex_home));
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        push_home_skill_lookup_roots(&mut roots, std::path::Path::new(&home));
+    }
+    if let Ok(claude_config_dir) = std::env::var("CLAUDE_CONFIG_DIR") {
+        let claude_config_dir = std::path::PathBuf::from(claude_config_dir);
+        push_skill_lookup_root(
+            &mut roots,
+            claude_config_dir.join("skills"),
+            SkillLookupOrigin::SkillsDir,
+        );
+        push_skill_lookup_root(
+            &mut roots,
+            claude_config_dir.join("skills").join("omc-learned"),
+            SkillLookupOrigin::SkillsDir,
+        );
+        push_skill_lookup_root(
+            &mut roots,
+            claude_config_dir.join("commands"),
+            SkillLookupOrigin::LegacyCommandsDir,
+        );
+    }
+    push_skill_lookup_root(
+        &mut roots,
+        std::path::PathBuf::from("/home/bellman/.claw/skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        &mut roots,
+        std::path::PathBuf::from("/home/bellman/.codex/skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+
+    roots
+}
+
+fn push_project_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, cwd: &std::path::Path) {
+    for ancestor in cwd.ancestors() {
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".omc"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".agents"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claw"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".codex"));
+        push_prefixed_skill_lookup_roots(roots, &ancestor.join(".claude"));
+    }
+}
+
+fn push_home_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, home: &std::path::Path) {
+    push_prefixed_skill_lookup_roots(roots, &home.join(".omc"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".claw"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".codex"));
+    push_prefixed_skill_lookup_roots(roots, &home.join(".claude"));
+    push_skill_lookup_root(
+        roots,
+        home.join(".agents").join("skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        roots,
+        home.join(".config").join("opencode").join("skills"),
+        SkillLookupOrigin::SkillsDir,
+    );
+    push_skill_lookup_root(
+        roots,
+        home.join(".claude").join("skills").join("omc-learned"),
+        SkillLookupOrigin::SkillsDir,
+    );
+}
+
+fn push_prefixed_skill_lookup_roots(roots: &mut Vec<SkillLookupRoot>, prefix: &std::path::Path) {
+    push_skill_lookup_root(roots, prefix.join("skills"), SkillLookupOrigin::SkillsDir);
+    push_skill_lookup_root(
+        roots,
+        prefix.join("commands"),
+        SkillLookupOrigin::LegacyCommandsDir,
+    );
+}
+
+fn push_skill_lookup_root(
+    roots: &mut Vec<SkillLookupRoot>,
+    path: std::path::PathBuf,
+    origin: SkillLookupOrigin,
+) {
+    if path.is_dir() && !roots.iter().any(|existing| existing.path == path) {
+        roots.push(SkillLookupRoot { path, origin });
+    }
+}
+
+fn resolve_skill_path_in_root(
+    root: &SkillLookupRoot,
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    match root.origin {
+        SkillLookupOrigin::SkillsDir => resolve_skill_path_in_skills_dir(&root.path, requested),
+        SkillLookupOrigin::LegacyCommandsDir => {
+            resolve_skill_path_in_legacy_commands_dir(&root.path, requested)
+        }
+    }
+}
+
+fn resolve_skill_path_in_skills_dir(
+    root: &std::path::Path,
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    let direct = root.join(requested).join("SKILL.md");
+    if direct.is_file() {
+        return Some(direct);
+    }
+
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let skill_path = entry.path().join("SKILL.md");
+        if !skill_path.is_file() {
+            continue;
+        }
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .eq_ignore_ascii_case(requested)
+            || skill_frontmatter_name_matches(&skill_path, requested)
+        {
+            return Some(skill_path);
+        }
+    }
+
+    None
+}
+
+fn resolve_skill_path_in_legacy_commands_dir(
+    root: &std::path::Path,
+    requested: &str,
+) -> Option<std::path::PathBuf> {
+    let direct_dir = root.join(requested).join("SKILL.md");
+    if direct_dir.is_file() {
+        return Some(direct_dir);
+    }
+
+    let direct_markdown = root.join(format!("{requested}.md"));
+    if direct_markdown.is_file() {
+        return Some(direct_markdown);
+    }
+
+    let entries = std::fs::read_dir(root).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let candidate_path = if path.is_dir() {
+            let skill_path = path.join("SKILL.md");
+            if !skill_path.is_file() {
+                continue;
+            }
+            skill_path
+        } else if path
+            .extension()
+            .is_some_and(|ext| ext.to_string_lossy().eq_ignore_ascii_case("md"))
+        {
+            path
+        } else {
+            continue;
+        };
+
+        let matches_entry_name = candidate_path
+            .file_stem()
+            .is_some_and(|stem| stem.to_string_lossy().eq_ignore_ascii_case(requested))
+            || entry
+                .file_name()
+                .to_string_lossy()
+                .trim_end_matches(".md")
+                .eq_ignore_ascii_case(requested);
+        if matches_entry_name || skill_frontmatter_name_matches(&candidate_path, requested) {
+            return Some(candidate_path);
+        }
+    }
+
+    None
+}
+
+fn skill_frontmatter_name_matches(path: &std::path::Path, requested: &str) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| parse_skill_name(&contents))
+        .is_some_and(|name| name.eq_ignore_ascii_case(requested))
+}
+
+fn parse_skill_name(contents: &str) -> Option<String> {
+    parse_skill_frontmatter_value(contents, "name")
+}
+
+fn parse_skill_frontmatter_value(contents: &str, key: &str) -> Option<String> {
+    let mut lines = contents.lines();
+    if lines.next().map(str::trim) != Some("---") {
+        return None;
+    }
+
+    for line in lines {
+        let trimmed = line.trim();
+        if trimmed == "---" {
+            break;
+        }
+        if let Some(value) = trimmed.strip_prefix(&format!("{key}:")) {
+            let value = value
+                .trim()
+                .trim_matches(|ch| matches!(ch, '"' | '\''))
+                .trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+
+    None
 }
 
 const DEFAULT_AGENT_MODEL: &str = "claude-opus-4-6";
@@ -3488,29 +3700,73 @@ fn classify_lane_failure(error: &str) -> LaneFailureClass {
     }
 }
 
+struct ProviderEntry {
+    model: String,
+    client: ProviderClient,
+}
+
 struct ProviderRuntimeClient {
     runtime: tokio::runtime::Runtime,
-    client: ProviderClient,
-    model: String,
+    chain: Vec<ProviderEntry>,
     allowed_tools: BTreeSet<String>,
 }
 
 impl ProviderRuntimeClient {
     #[allow(clippy::needless_pass_by_value)]
     fn new(model: String, allowed_tools: BTreeSet<String>) -> Result<Self, String> {
-        let model = resolve_model_alias(&model).clone();
-        let client = ProviderClient::from_model(&model).map_err(|error| error.to_string())?;
+        let fallback_config = load_provider_fallback_config();
+        Self::new_with_fallback_config(model, allowed_tools, &fallback_config)
+    }
+
+    #[allow(clippy::needless_pass_by_value)]
+    fn new_with_fallback_config(
+        model: String,
+        allowed_tools: BTreeSet<String>,
+        fallback_config: &ProviderFallbackConfig,
+    ) -> Result<Self, String> {
+        let primary_model = fallback_config
+            .primary()
+            .map(str::to_string)
+            .unwrap_or(model);
+        let primary = build_provider_entry(&primary_model)?;
+        let mut chain = vec![primary];
+        for fallback_model in fallback_config.fallbacks() {
+            match build_provider_entry(fallback_model) {
+                Ok(entry) => chain.push(entry),
+                Err(error) => {
+                    eprintln!(
+                        "warning: skipping unavailable fallback provider {fallback_model}: {error}"
+                    );
+                }
+            }
+        }
         Ok(Self {
             runtime: tokio::runtime::Runtime::new().map_err(|error| error.to_string())?,
-            client,
-            model,
+            chain,
             allowed_tools,
         })
     }
 }
 
+fn build_provider_entry(model: &str) -> Result<ProviderEntry, String> {
+    let resolved = resolve_model_alias(model).clone();
+    let client = ProviderClient::from_model(&resolved).map_err(|error| error.to_string())?;
+    Ok(ProviderEntry {
+        model: resolved,
+        client,
+    })
+}
+
+fn load_provider_fallback_config() -> ProviderFallbackConfig {
+    std::env::current_dir()
+        .ok()
+        .and_then(|cwd| ConfigLoader::default_for(cwd).load().ok())
+        .map_or_else(ProviderFallbackConfig::default, |config| {
+            config.provider_fallbacks().clone()
+        })
+}
+
 impl ApiClient for ProviderRuntimeClient {
-    #[allow(clippy::too_many_lines)]
     fn stream(&mut self, request: ApiRequest) -> Result<Vec<AssistantEvent>, RuntimeError> {
         let tools = tool_specs_for_allowed_tools(Some(&self.allowed_tools))
             .into_iter()
@@ -3520,106 +3776,129 @@ impl ApiClient for ProviderRuntimeClient {
                 input_schema: spec.input_schema,
             })
             .collect::<Vec<_>>();
-        let message_request = MessageRequest {
-            model: self.model.clone(),
-            max_tokens: max_tokens_for_model(&self.model),
-            messages: convert_messages(&request.messages),
-            system: (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n")),
-            tools: (!tools.is_empty()).then_some(tools),
-            tool_choice: (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto),
-            stream: true,
-        };
+        let messages = convert_messages(&request.messages);
+        let system = (!request.system_prompt.is_empty()).then(|| request.system_prompt.join("\n\n"));
+        let tool_choice = (!self.allowed_tools.is_empty()).then_some(ToolChoice::Auto);
 
-        self.runtime.block_on(async {
-            let mut stream = self
-                .client
-                .stream_message(&message_request)
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut events = Vec::new();
-            let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
-            let mut saw_stop = false;
+        let runtime = &self.runtime;
+        let chain = &self.chain;
+        let mut last_error: Option<ApiError> = None;
+        for (index, entry) in chain.iter().enumerate() {
+            let message_request = MessageRequest {
+                model: entry.model.clone(),
+                max_tokens: max_tokens_for_model(&entry.model),
+                messages: messages.clone(),
+                system: system.clone(),
+                tools: (!tools.is_empty()).then(|| tools.clone()),
+                tool_choice: tool_choice.clone(),
+                stream: true,
+            };
 
-            while let Some(event) = stream
-                .next_event()
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?
-            {
-                match event {
-                    ApiStreamEvent::MessageStart(start) => {
-                        for block in start.message.content {
-                            push_output_block(block, 0, &mut events, &mut pending_tools, true);
-                        }
-                    }
-                    ApiStreamEvent::ContentBlockStart(start) => {
-                        push_output_block(
-                            start.content_block,
-                            start.index,
-                            &mut events,
-                            &mut pending_tools,
-                            true,
-                        );
-                    }
-                    ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
-                        ContentBlockDelta::TextDelta { text } => {
-                            if !text.is_empty() {
-                                events.push(AssistantEvent::TextDelta(text));
-                            }
-                        }
-                        ContentBlockDelta::InputJsonDelta { partial_json } => {
-                            if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
-                                input.push_str(&partial_json);
-                            }
-                        }
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::SignatureDelta { .. } => {}
-                    },
-                    ApiStreamEvent::ContentBlockStop(stop) => {
-                        if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
-                            events.push(AssistantEvent::ToolUse { id, name, input });
-                        }
-                    }
-                    ApiStreamEvent::MessageDelta(delta) => {
-                        events.push(AssistantEvent::Usage(delta.usage.token_usage()));
-                    }
-                    ApiStreamEvent::MessageStop(_) => {
-                        saw_stop = true;
-                        events.push(AssistantEvent::MessageStop);
-                    }
+            let attempt = runtime.block_on(stream_with_provider(&entry.client, &message_request));
+            match attempt {
+                Ok(events) => return Ok(events),
+                Err(error) if error.is_retryable() && index + 1 < chain.len() => {
+                    eprintln!(
+                        "provider {} failed with retryable error, falling back: {error}",
+                        entry.model
+                    );
+                    last_error = Some(error);
+                    continue;
+                }
+                Err(error) => return Err(RuntimeError::new(error.to_string())),
+            }
+        }
+
+        Err(RuntimeError::new(
+            last_error
+                .map(|error| error.to_string())
+                .unwrap_or_else(|| String::from("provider chain exhausted with no attempts")),
+        ))
+    }
+}
+
+#[allow(clippy::too_many_lines)]
+async fn stream_with_provider(
+    client: &ProviderClient,
+    message_request: &MessageRequest,
+) -> Result<Vec<AssistantEvent>, ApiError> {
+    let mut stream = client.stream_message(message_request).await?;
+    let mut events = Vec::new();
+    let mut pending_tools: BTreeMap<u32, (String, String, String)> = BTreeMap::new();
+    let mut saw_stop = false;
+
+    while let Some(event) = stream.next_event().await? {
+        match event {
+            ApiStreamEvent::MessageStart(start) => {
+                for block in start.message.content {
+                    push_output_block(block, 0, &mut events, &mut pending_tools, true);
                 }
             }
-
-            push_prompt_cache_record(&self.client, &mut events);
-
-            if !saw_stop
-                && events.iter().any(|event| {
-                    matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
-                        || matches!(event, AssistantEvent::ToolUse { .. })
-                })
-            {
+            ApiStreamEvent::ContentBlockStart(start) => {
+                push_output_block(
+                    start.content_block,
+                    start.index,
+                    &mut events,
+                    &mut pending_tools,
+                    true,
+                );
+            }
+            ApiStreamEvent::ContentBlockDelta(delta) => match delta.delta {
+                ContentBlockDelta::TextDelta { text } => {
+                    if !text.is_empty() {
+                        events.push(AssistantEvent::TextDelta(text));
+                    }
+                }
+                ContentBlockDelta::InputJsonDelta { partial_json } => {
+                    if let Some((_, _, input)) = pending_tools.get_mut(&delta.index) {
+                        input.push_str(&partial_json);
+                    }
+                }
+                ContentBlockDelta::ThinkingDelta { .. }
+                | ContentBlockDelta::SignatureDelta { .. } => {}
+            },
+            ApiStreamEvent::ContentBlockStop(stop) => {
+                if let Some((id, name, input)) = pending_tools.remove(&stop.index) {
+                    events.push(AssistantEvent::ToolUse { id, name, input });
+                }
+            }
+            ApiStreamEvent::MessageDelta(delta) => {
+                events.push(AssistantEvent::Usage(delta.usage.token_usage()));
+            }
+            ApiStreamEvent::MessageStop(_) => {
+                saw_stop = true;
                 events.push(AssistantEvent::MessageStop);
             }
-
-            if events
-                .iter()
-                .any(|event| matches!(event, AssistantEvent::MessageStop))
-            {
-                return Ok(events);
-            }
-
-            let response = self
-                .client
-                .send_message(&MessageRequest {
-                    stream: false,
-                    ..message_request.clone()
-                })
-                .await
-                .map_err(|error| RuntimeError::new(error.to_string()))?;
-            let mut events = response_to_events(response);
-            push_prompt_cache_record(&self.client, &mut events);
-            Ok(events)
-        })
+        }
     }
+
+    push_prompt_cache_record(client, &mut events);
+
+    if !saw_stop
+        && events.iter().any(|event| {
+            matches!(event, AssistantEvent::TextDelta(text) if !text.is_empty())
+                || matches!(event, AssistantEvent::ToolUse { .. })
+        })
+    {
+        events.push(AssistantEvent::MessageStop);
+    }
+
+    if events
+        .iter()
+        .any(|event| matches!(event, AssistantEvent::MessageStop))
+    {
+        return Ok(events);
+    }
+
+    let response = client
+        .send_message(&MessageRequest {
+            stream: false,
+            ..message_request.clone()
+        })
+        .await?;
+    let mut events = response_to_events(response);
+    push_prompt_cache_record(client, &mut events);
+    Ok(events)
 }
 
 struct SubagentToolExecutor {
@@ -5027,6 +5306,7 @@ fn parse_skill_description(contents: &str) -> Option<String> {
 }
 
 pub mod lane_completion;
+pub mod pdf_extract;
 
 #[cfg(test)]
 mod tests {
@@ -5046,8 +5326,10 @@ mod tests {
         derive_agent_state, execute_agent_with_spawn, execute_tool, final_assistant_text,
         maybe_commit_provenance, mvp_tool_specs, permission_mode_from_plugin,
         persist_agent_terminal_state, push_output_block, run_task_packet, AgentInput, AgentJob,
-        GlobalToolRegistry, LaneEventName, LaneFailureClass, SubagentToolExecutor,
+        GlobalToolRegistry, LaneEventName, LaneFailureClass, ProviderRuntimeClient,
+        SubagentToolExecutor,
     };
+    use runtime::ProviderFallbackConfig;
     use api::OutputContentBlock;
     use runtime::{
         permission_enforcer::PermissionEnforcer, ApiRequest, AssistantEvent, ConversationRuntime,
@@ -5795,6 +6077,349 @@ mod tests {
             std::env::remove_var("HOME");
         }
         fs::remove_dir_all(home).expect("temp home should clean up");
+    }
+
+    #[test]
+    fn skill_resolves_project_local_skills_and_legacy_commands() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("project-skills");
+        let skill_dir = root.join(".claw").join("skills").join("plan");
+        let command_dir = root.join(".claw").join("commands");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::create_dir_all(&command_dir).expect("command dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: plan\ndescription: Project planning guidance\n---\n\n# plan\n",
+        )
+        .expect("skill file should exist");
+        fs::write(
+            command_dir.join("handoff.md"),
+            "---\nname: handoff\ndescription: Legacy handoff guidance\n---\n\n# handoff\n",
+        )
+        .expect("command file should exist");
+
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("set cwd");
+
+        let skill_result = execute_tool("Skill", &json!({ "skill": "$plan" }))
+            .expect("project-local skill should resolve");
+        let skill_output: serde_json::Value =
+            serde_json::from_str(&skill_result).expect("valid json");
+        assert!(skill_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claw/skills/plan/SKILL.md"));
+
+        let command_result = execute_tool("Skill", &json!({ "skill": "/handoff" }))
+            .expect("legacy command should resolve");
+        let command_output: serde_json::Value =
+            serde_json::from_str(&command_result).expect("valid json");
+        assert!(command_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claw/commands/handoff.md"));
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        fs::remove_dir_all(root).expect("temp project should clean up");
+    }
+
+    #[test]
+    fn skill_loads_project_local_claude_skill_prompt() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("project-skills");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let skill_dir = workspace.join(".claude").join("skills").join("trace");
+        fs::create_dir_all(&skill_dir).expect("skill dir should exist");
+        fs::create_dir_all(&nested).expect("nested cwd should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: trace\ndescription: Project-local trace helper\n---\n# trace\n",
+        )
+        .expect("skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&nested).expect("set cwd");
+
+        let result = execute_tool("Skill", &json!({ "skill": "trace" }))
+            .expect("project-local skill should resolve");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claude/skills/trace/SKILL.md"));
+        assert_eq!(output["description"], "Project-local trace helper");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_project_local_omc_and_agents_skill_prompts() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("project-omc-skills");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let omc_skill_dir = workspace.join(".omc").join("skills").join("hud");
+        let agents_skill_dir = workspace.join(".agents").join("skills").join("trace");
+        fs::create_dir_all(&omc_skill_dir).expect("omc skill dir should exist");
+        fs::create_dir_all(&agents_skill_dir).expect("agents skill dir should exist");
+        fs::create_dir_all(&nested).expect("nested cwd should exist");
+        fs::write(
+            omc_skill_dir.join("SKILL.md"),
+            "---\nname: hud\ndescription: Project-local OMC HUD helper\n---\n# hud\n",
+        )
+        .expect("omc skill file should exist");
+        fs::write(
+            agents_skill_dir.join("SKILL.md"),
+            "---\nname: trace\ndescription: Project-local agents compatibility helper\n---\n# trace\n",
+        )
+        .expect("agents skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&nested).expect("set cwd");
+
+        let omc_result =
+            execute_tool("Skill", &json!({ "skill": "hud" })).expect("omc skill should resolve");
+        let agents_result = execute_tool("Skill", &json!({ "skill": "trace" }))
+            .expect("agents skill should resolve");
+
+        let omc_output: serde_json::Value = serde_json::from_str(&omc_result).expect("valid json");
+        let agents_output: serde_json::Value =
+            serde_json::from_str(&agents_result).expect("valid json");
+        assert!(omc_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".omc/skills/hud/SKILL.md"));
+        assert_eq!(omc_output["description"], "Project-local OMC HUD helper");
+        assert!(agents_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".agents/skills/trace/SKILL.md"));
+        assert_eq!(
+            agents_output["description"],
+            "Project-local agents compatibility helper"
+        );
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_learned_skill_from_claude_config_dir() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("claude-config-learned-skill");
+        let home = root.join("home");
+        let claude_config_dir = root.join("claude-config");
+        let learned_skill_dir = claude_config_dir
+            .join("skills")
+            .join("omc-learned")
+            .join("learned");
+        fs::create_dir_all(&learned_skill_dir).expect("learned skill dir should exist");
+        fs::write(
+            learned_skill_dir.join("SKILL.md"),
+            "---\nname: learned\ndescription: Learned OMC skill\n---\n# learned\n",
+        )
+        .expect("learned skill file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
+
+        let result = execute_tool("Skill", &json!({ "skill": "learned" }))
+            .expect("learned skill should resolve");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("skills/omc-learned/learned/SKILL.md"));
+        assert_eq!(output["description"], "Learned OMC skill");
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_direct_skill_and_legacy_command_from_claude_config_dir() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("claude-config-direct-skill");
+        let home = root.join("home");
+        let claude_config_dir = root.join("claude-config");
+        let skill_dir = claude_config_dir.join("skills").join("statusline");
+        let command_dir = claude_config_dir.join("commands");
+        fs::create_dir_all(&skill_dir).expect("direct skill dir should exist");
+        fs::create_dir_all(&command_dir).expect("command dir should exist");
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: statusline\ndescription: Claude config skill\n---\n# statusline\n",
+        )
+        .expect("direct skill file should exist");
+        fs::write(
+            command_dir.join("doctor-check.md"),
+            "---\nname: doctor-check\ndescription: Claude config command\n---\n# doctor-check\n",
+        )
+        .expect("direct command file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_claude_config_dir = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_var("CLAUDE_CONFIG_DIR", &claude_config_dir);
+
+        let direct_skill =
+            execute_tool("Skill", &json!({ "skill": "statusline" })).expect("direct skill");
+        let direct_skill_output: serde_json::Value =
+            serde_json::from_str(&direct_skill).expect("valid skill json");
+        assert!(direct_skill_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("skills/statusline/SKILL.md"));
+        assert_eq!(direct_skill_output["description"], "Claude config skill");
+
+        let legacy_command =
+            execute_tool("Skill", &json!({ "skill": "doctor-check" })).expect("direct command");
+        let legacy_command_output: serde_json::Value =
+            serde_json::from_str(&legacy_command).expect("valid command json");
+        assert!(legacy_command_output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with("commands/doctor-check.md"));
+        assert_eq!(
+            legacy_command_output["description"],
+            "Claude config command"
+        );
+
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        match original_claude_config_dir {
+            Some(value) => std::env::set_var("CLAUDE_CONFIG_DIR", value),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
+    }
+
+    #[test]
+    fn skill_loads_project_local_legacy_command_markdown() {
+        let _guard = env_lock().lock().expect("env lock should acquire");
+        let root = temp_path("project-legacy-command");
+        let home = root.join("home");
+        let workspace = root.join("workspace");
+        let nested = workspace.join("nested");
+        let command_dir = workspace.join(".claude").join("commands");
+        fs::create_dir_all(&command_dir).expect("legacy command dir should exist");
+        fs::create_dir_all(&nested).expect("nested cwd should exist");
+        fs::write(
+            command_dir.join("team.md"),
+            "---\nname: team\ndescription: Legacy team workflow\n---\n# team\n",
+        )
+        .expect("legacy command file should exist");
+
+        let original_home = std::env::var("HOME").ok();
+        let original_config_home = std::env::var("CLAW_CONFIG_HOME").ok();
+        let original_codex_home = std::env::var("CODEX_HOME").ok();
+        let original_dir = std::env::current_dir().expect("cwd");
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("CLAW_CONFIG_HOME");
+        std::env::remove_var("CODEX_HOME");
+        std::env::set_current_dir(&nested).expect("set cwd");
+
+        let result = execute_tool("Skill", &json!({ "skill": "team" }))
+            .expect("legacy command markdown should resolve");
+
+        let output: serde_json::Value = serde_json::from_str(&result).expect("valid json");
+        assert!(output["path"]
+            .as_str()
+            .expect("path")
+            .ends_with(".claude/commands/team.md"));
+        assert_eq!(output["description"], "Legacy team workflow");
+
+        std::env::set_current_dir(&original_dir).expect("restore cwd");
+        match original_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match original_config_home {
+            Some(value) => std::env::set_var("CLAW_CONFIG_HOME", value),
+            None => std::env::remove_var("CLAW_CONFIG_HOME"),
+        }
+        match original_codex_home {
+            Some(value) => std::env::set_var("CODEX_HOME", value),
+            None => std::env::remove_var("CODEX_HOME"),
+        }
+        fs::remove_dir_all(root).expect("temp tree should clean up");
     }
 
     #[test]
@@ -7213,6 +7838,151 @@ printf 'pwsh:%s' "$1"
             .expect("bash should succeed without enforcer");
         let output: serde_json::Value = serde_json::from_str(&result).expect("json");
         assert_eq!(output["stdout"], "ok");
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_uses_only_primary_when_no_fallbacks_configured() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        let fallback_config = ProviderFallbackConfig::default();
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("primary-only chain should construct");
+
+        // then
+        assert_eq!(client.chain.len(), 1);
+        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_appends_configured_fallbacks_in_order() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_xai = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::set_var("XAI_API_KEY", "xai-test-key");
+        let fallback_config = ProviderFallbackConfig::new(
+            None,
+            vec!["grok-3".to_string(), "grok-3-mini".to_string()],
+        );
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("chain with fallbacks should construct");
+
+        // then
+        assert_eq!(client.chain.len(), 3);
+        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[1].model, "grok-3");
+        assert_eq!(client.chain[2].model, "grok-3-mini");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_xai {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_primary_override_replaces_constructor_model() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_xai = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::set_var("XAI_API_KEY", "xai-test-key");
+        let fallback_config = ProviderFallbackConfig::new(
+            Some("grok-3".to_string()),
+            vec!["claude-sonnet-4-6".to_string()],
+        );
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-haiku-4-5-20251213".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("chain with primary override should construct");
+
+        // then
+        assert_eq!(client.chain.len(), 2);
+        assert_eq!(client.chain[0].model, "grok-3");
+        assert_eq!(client.chain[1].model, "claude-sonnet-4-6");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        match original_xai {
+            Some(value) => std::env::set_var("XAI_API_KEY", value),
+            None => std::env::remove_var("XAI_API_KEY"),
+        }
+    }
+
+    #[test]
+    fn provider_runtime_client_chain_skips_fallbacks_missing_credentials() {
+        // given
+        let _guard = env_lock()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let original_anthropic = std::env::var_os("ANTHROPIC_API_KEY");
+        let original_xai = std::env::var_os("XAI_API_KEY");
+        std::env::set_var("ANTHROPIC_API_KEY", "anthropic-test-key");
+        std::env::remove_var("XAI_API_KEY");
+        let fallback_config = ProviderFallbackConfig::new(
+            None,
+            vec![
+                "grok-3".to_string(),
+                "claude-haiku-4-5-20251213".to_string(),
+            ],
+        );
+
+        // when
+        let client = ProviderRuntimeClient::new_with_fallback_config(
+            "claude-sonnet-4-6".to_string(),
+            BTreeSet::new(),
+            &fallback_config,
+        )
+        .expect("chain construction should not fail when only some fallbacks are unavailable");
+
+        // then
+        assert_eq!(client.chain.len(), 2);
+        assert_eq!(client.chain[0].model, "claude-sonnet-4-6");
+        assert_eq!(client.chain[1].model, "claude-haiku-4-5-20251213");
+
+        match original_anthropic {
+            Some(value) => std::env::set_var("ANTHROPIC_API_KEY", value),
+            None => std::env::remove_var("ANTHROPIC_API_KEY"),
+        }
+        if let Some(value) = original_xai {
+            std::env::set_var("XAI_API_KEY", value);
+        }
     }
 
     #[test]
