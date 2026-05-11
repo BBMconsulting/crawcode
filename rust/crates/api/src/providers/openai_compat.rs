@@ -463,6 +463,7 @@ impl StreamState {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn ingest_chunk(&mut self, chunk: ChatCompletionChunk) -> Result<Vec<StreamEvent>, ApiError> {
         let mut events = Vec::new();
         if !self.message_started {
@@ -855,7 +856,7 @@ pub fn is_reasoning_model(model: &str) -> bool {
         || canonical.contains("thinking")
 }
 
-/// Returns true for OpenAI-compatible DeepSeek V4 models that require prior
+/// Returns true for OpenAI-compatible `DeepSeek` V4 models that require prior
 /// assistant reasoning to be echoed back as `reasoning_content` in history.
 #[must_use]
 pub fn model_requires_reasoning_content_in_history(model: &str) -> bool {
@@ -1083,8 +1084,7 @@ pub fn translate_message(message: &InputMessage, model: &str) -> Vec<Value> {
                     }
                     Some(msg)
                 }
-                InputContentBlock::Thinking { .. } => None,
-                InputContentBlock::ToolUse { .. } => None,
+                InputContentBlock::Thinking { .. } | InputContentBlock::ToolUse { .. } => None,
             })
             .collect(),
     }

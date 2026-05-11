@@ -4,7 +4,16 @@
     unused_variables,
     clippy::unneeded_struct_pattern,
     clippy::unnecessary_wraps,
-    clippy::unused_self
+    clippy::unused_self,
+    clippy::doc_markdown,
+    clippy::match_same_arms,
+    clippy::redundant_closure_for_method_calls,
+    clippy::result_large_err,
+    clippy::too_many_lines,
+    clippy::uninlined_format_args,
+    clippy::unnecessary_lazy_evaluations,
+    clippy::unnested_or_patterns,
+    clippy::useless_format
 )]
 mod init;
 mod input;
